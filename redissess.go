@@ -10,8 +10,6 @@ import (
 	"encoding/base32"
 	"time"
 	"net/http"
-	// "fmt"
-	// "math"
 )
 
 
@@ -23,15 +21,6 @@ type ConnInfo struct {
 	Addr string
 	DB int
 }
-
-// type SessionOpt struct {
-// 	Name string
-// 	Path string
-// 	Domain string
-// 	Lifetime int
-// 	HttpOnly bool
-// 	Secure bool
-// }
 
 
 type SessionParam struct{
@@ -82,7 +71,7 @@ func New(conn ConnInfo,param SessionParam) *RedisClient {
 }
 
 func (rc *RedisClient) Close() {
-	rc.Close()
+	rc.Client.Close()
 }
 
 
@@ -94,8 +83,7 @@ func createSessid() (string, error) {
 	return strings.TrimRight(base32.StdEncoding.EncodeToString(k), "="), nil
 }
 
-
-func (rc *RedisClient) Create(obj interface{}) (*http.Cookie,error) {
+func  (rc *RedisClient) Create() (*http.Cookie,error) {
 
 	str,err := createSessid()
 
@@ -103,9 +91,11 @@ func (rc *RedisClient) Create(obj interface{}) (*http.Cookie,error) {
 		return nil,err
 	}
 
-	// limit := time.Now().Add(time.Duration(sessparam.MaxAge) * time.Second)
-
-	err = rc.Set(str,obj)
+	err = rc.Client.Set(context.Background(),
+						str,
+						nil,
+						time.Second*time.Duration(*sessparam.Lifetime),
+					).Err()
 
 	if err != nil {
 		return nil,err
@@ -114,22 +104,31 @@ func (rc *RedisClient) Create(obj interface{}) (*http.Cookie,error) {
 
 
 	return newCookie(str),nil
-
-	// return &http.Cookie{
-	// 	Name : sessparam.Name,
-	// 	Value : str,
-	// 	Domain: sessparam.Domain,
-	// 	Path : sessparam.Path,
-	// 	MaxAge : sessparam.MaxAge,
-	// 	HttpOnly : sessparam.HttpOnly,
-	// 	Secure : sessparam.Secure,
-	// 	SameSite: sessparam.SameSite,
-	// },nil
 }
 
 
 
-func (rc *RedisClient) Set(key string,obj interface{}) error {
+
+func (rc *RedisClient) CreateAndSet(suffix string,obj interface{}) (*http.Cookie,error) {
+
+	str,err := createSessid()
+
+	if err != nil {
+		return nil,err
+	}
+
+	err = rc.Set(str,suffix,obj)
+
+	if err != nil {
+		return nil,err
+	}
+
+	return newCookie(str),nil
+}
+
+
+
+func (rc *RedisClient) Set(key string,suffix string,obj interface{}) error {
 
 	jobj,err := json.Marshal(obj)
 
@@ -137,26 +136,59 @@ func (rc *RedisClient) Set(key string,obj interface{}) error {
 	 	return err
 	 }
 
-	err = rc.Client.Set(context.Background(), 
+
+	ctx := context.Background()
+
+	// err = rc.Client.Watch(ctx,func(tx *redis.Tx) error {
+		
+	// 		// data, err := tx.Get(ctx, key).Result()
+	// 		_, err := tx.Get(ctx, key).Result()
+
+	// 		if err != nil && err != redis.Nil {
+	// 			return err
+	// 		}
+
+	// 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+	// 			pipe.HSet(ctx,key,suffix,jobj)
+
+	// 			pipe.Expire(ctx,
+	// 			 			key,
+	// 			 			time.Second*time.Duration(*sessparam.Lifetime),
+	// 			 		)
+
+	// 			return nil
+	// 		})
+
+	// 		return err
+
+	// 	},key,
+	// )
+
+	err = rc.Client.HSet(ctx, 
 					   key,
+					   suffix,
 					   jobj,
-					   time.Second*time.Duration(*sessparam.Lifetime),
 			).Err()
 
 	if err != nil {
   		return err
 	}
 
+	if err = rc.setExpire(ctx,key) ; err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (rc *RedisClient) Get(key string,obj interface{}) (*int,error) {
+
+func (rc *RedisClient) Get(key string,suffix string,obj interface{}) (*int,error) {
 	
 	ret := DATA_NOT_FOUND
 
 	ctx := context.Background()
 
-	data,err := rc.Client.Get(ctx,key).Result()
+	data,err := rc.Client.HGet(ctx,key,suffix).Result()
 
 	if err == redis.Nil {
 		return &ret,nil
@@ -173,15 +205,19 @@ func (rc *RedisClient) Get(key string,obj interface{}) (*int,error) {
 			return nil,err
 		}
 	}
-	ret = DATA_FOUND
 
 	if err = rc.setExpire(ctx,key) ; err != nil {
 
 		return nil,err
 	}
 
+
+	ret = DATA_FOUND
+
 	return &ret,nil
 }
+
+
 
 
 func (rc *RedisClient) setExpire(ctx context.Context, key string) error {
@@ -231,13 +267,15 @@ func (rc *RedisClient) Delete(key string) (*http.Cookie,error) {
 		return nil,err
 	}
 
-	// return newCookie(""),nil
+	expiresAt := time.Now()
+	expiresAt = expiresAt.Add(time.Second*(-10))
 
 	return &http.Cookie{
 		Name : sessparam.Name,
 		Value : "",
 		Domain: sessparam.Domain,
 		Path : sessparam.Path,
+		Expires:expiresAt,
 		MaxAge : -1,
 		HttpOnly : sessparam.HttpOnly,
 		Secure : sessparam.Secure,
@@ -261,21 +299,41 @@ func newCookie(value string ) *http.Cookie {
 }
 
 
- func (rc *RedisClient) Regenerate(key string) (*http.Cookie,error) {
+ func (rc *RedisClient) Regenerate(currentkey string) (*http.Cookie,error) {
 
-	var obj interface{}
+	dbnbr := rc.Client.Options().DB
 
-	res,err := rc.Get(key,obj)
+	destkey,err := createSessid()
 
-	if err != nil || *res==0 {
+	if err != nil {
+		return nil,err
+	}	
+
+	ctx := context.Background()
+
+	n,err := rc.Client.Copy(ctx,currentkey,destkey,dbnbr,false).Result()
+
+	if err != nil || n==0 {
 		return nil,err
 	}
 
-	_,err = rc.Delete(key)
+	_,err = rc.Delete(currentkey)
 
 	if err != nil {
 		return nil,err
 	}
 
-	return rc.Create(obj)
+	return newCookie(destkey),nil
  }
+
+
+ func (rc *RedisClient) RemoveChild(key string,suffix string) error {
+ 
+	err := rc.Client.HDel(context.Background(),key,suffix).Err()
+
+	if err!=nil {
+		return err
+	}
+
+	return nil
+}
