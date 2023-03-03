@@ -164,6 +164,36 @@ func (rc *RedisClient) Set(key string,suffix string,obj interface{}) error {
 	// 	},key,
 	// )
 
+//type
+
+	ret ,err := rc.Client.Type(ctx,key).Result()
+
+	if err != nil {
+		return err
+  	}
+
+	if ret != "hash" {
+
+		if err := rc.Client.Del(ctx,key).Err(); err!=nil{
+			return err
+		}
+
+		err = rc.Client.HSetNX(ctx, 
+						key,
+						suffix,
+						jobj,
+				).Err()
+
+		if err != nil {
+			return err
+		}
+		
+
+	}
+
+
+
+
 	err = rc.Client.HSet(ctx, 
 					   key,
 					   suffix,
